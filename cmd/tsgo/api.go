@@ -18,6 +18,7 @@ func runAPI(args []string) int {
 	flag := flag.NewFlagSet("api", flag.ContinueOnError)
 	cwd := flag.String("cwd", core.Must(os.Getwd()), "current working directory")
 	pipePath := flag.String("pipe", "", "use named pipe or Unix domain socket for communication instead of stdio")
+	shmName := flag.String("shm", "", "use shared memory region for communication (name of existing shm object created by parent)")
 	callbacks := flag.String("callbacks", "", "comma-separated list of FS callbacks to enable (readFile,fileExists,directoryExists,getAccessibleEntries,realpath)")
 	async := flag.Bool("async", false, "use JSON-RPC protocol instead of MessagePack (for async API)")
 	if err := flag.Parse(args); err != nil {
@@ -39,7 +40,9 @@ func runAPI(args []string) int {
 		Callbacks:          callbacksList,
 		Async:              *async,
 	}
-	if *pipePath != "" {
+	if *shmName != "" {
+		options.ShmName = *shmName
+	} else if *pipePath != "" {
 		options.PipePath = *pipePath
 	} else {
 		options.In = os.Stdin

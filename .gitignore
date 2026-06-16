@@ -190,7 +190,7 @@ custom-gcl.exe
 custom-gcl.hash
 
 /built
-
+/_packages/native-preview-shm/target
 # macOS Finder metadata
 .DS_Store
 

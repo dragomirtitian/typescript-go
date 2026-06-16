@@ -224,6 +224,30 @@ export const tsgoBuild = task({
     },
 });
 
+export const shmAddonBuild = task({
+    name: "shm-addon:build",
+    description: "Builds the shared memory native addon (requires Rust toolchain).",
+    run: async () => {
+        const crateDir = "./_packages/native-preview-shm";
+        if (!fs.existsSync(path.join(crateDir, "Cargo.toml"))) {
+            return;
+        }
+        const hasRust = await which("cargo", { nothrow: true });
+        if (!hasRust) {
+            console.log(pc.yellow("Skipping shm-addon:build — cargo not found"));
+            return;
+        }
+        await $`cargo build --release --manifest-path ${crateDir}/Cargo.toml`;
+        const outDir = "./built/local";
+        fs.mkdirSync(outDir, { recursive: true });
+        const ext = process.platform === "win32" ? "dll" : process.platform === "darwin" ? "dylib" : "so";
+        const src = `${crateDir}/target/release/libtsgo_shm.${ext}`;
+        if (fs.existsSync(src)) {
+            fs.copyFileSync(src, path.join(outDir, "tsgo-shm.node"));
+        }
+    },
+});
+
 export const tsgo = task({
     name: "tsgo",
     dependencies: [lib, tsgoBuild],
@@ -231,7 +255,7 @@ export const tsgo = task({
 
 export const local = task({
     name: "local",
-    dependencies: [tsgo],
+    dependencies: [tsgo, shmAddonBuild],
 });
 
 export const build = task({

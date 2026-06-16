@@ -1,3 +1,7 @@
+import * as fs from "node:fs";
+import * as module from "node:module";
+import * as path from "node:path";
+
 import { fsCallbackNames } from "../fs.ts";
 import {
     type ClientOptions,
@@ -6,12 +10,39 @@ import {
     isSpawnOptions,
     resolveExePath,
 } from "../options.ts";
+import { type ShmAddon, ShmRpcChannel } from "../shmChannel.ts";
 import { SyncRpcChannel } from "../syncChannel.ts";
 
 export type { ClientOptions, ClientSocketOptions, ClientSpawnOptions };
 
+/** Try to load the shared memory native addon from the same directory as the tsgo exe.
+ *  Set TS_API_TRANSPORT=pipe to force pipe-based channel (for benchmarking). */
+function tryLoadShmAddon(exePath: string): ShmAddon | null {
+    if (process.env["TS_API_TRANSPORT"] === "pipe") {
+        return null;
+    }
+    try {
+        const addonPath = path.join(path.dirname(exePath), "tsgo-shm.node");
+        if (!fs.existsSync(addonPath)) {
+            return null;
+        }
+        const require2 = module.createRequire(import.meta.url ?? __filename);
+        return require2(addonPath);
+    }
+    catch(e) {
+        return null;
+    }
+}
+
+interface RpcChannel {
+    requestSync(method: string, payload: string): string;
+    requestBinarySync(method: string, payload: Uint8Array): Uint8Array;
+    registerCallback(name: string, callback: (name: string, payload: string) => string): void;
+    close(): void;
+}
+
 export class Client {
-    private channel: SyncRpcChannel;
+    private channel: RpcChannel;
     private encoder = new TextEncoder();
 
     constructor(options: ClientOptions) {
@@ -39,7 +70,20 @@ export class Client {
             args.push(`--callbacks=${enabledCallbacks.join(",")}`);
         }
 
-        const channel = new SyncRpcChannel(resolveExePath(options), args);
+        const exe = resolveExePath(options);
+
+        // Try shared memory transport, fall back to pipe-based transport
+        const addon = tryLoadShmAddon(exe);
+        let channel: RpcChannel;
+        if (addon) {
+            const shmName = `/tsgo-shm-${process.pid}-${Date.now()}`;
+            const shmSize = 64 * 1024 * 1024; // 64MB
+            const shmBuffer = addon.createSharedMemory(shmName, shmSize);
+            channel = new ShmRpcChannel(exe, [...args, "--shm", shmName], shmBuffer, shmSize, shmName, addon);
+        }
+        else {
+            channel = new SyncRpcChannel(exe, args);
+        }
         this.channel = channel;
 
         if (options.fs) {

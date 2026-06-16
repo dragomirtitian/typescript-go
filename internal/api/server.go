@@ -21,6 +21,9 @@ type StdioServerOptions struct {
 	// PipePath, if set, listens on a named pipe (Windows) or Unix domain
 	// socket instead of using In/Out for communication.
 	PipePath string
+	// ShmName, if set, uses a shared memory region for communication instead
+	// of pipes. The named region must already exist (created by the parent process).
+	ShmName string
 	// Callbacks specifies which filesystem operations should be delegated
 	// to the client (e.g., "readFile", "fileExists"). Empty means no callbacks.
 	Callbacks []string
@@ -49,20 +52,6 @@ func NewStdioServer(options *StdioServerOptions) *StdioServer {
 
 // Run starts the server and blocks until the connection closes.
 func (s *StdioServer) Run(ctx context.Context) error {
-	var transport Transport
-	if s.options.PipePath != "" {
-		t, err := NewPipeTransport(s.options.PipePath)
-		if err != nil {
-			return fmt.Errorf("failed to create pipe transport: %w", err)
-		}
-		defer t.Close()
-		transport = t
-	} else {
-		t := NewStdioTransport(s.options.In, s.options.Out)
-		defer t.Close()
-		transport = t
-	}
-
 	fs := bundled.WrapFS(osvfs.FS())
 
 	// Wrap the base FS with callbackFS if callbacks are requested
@@ -89,14 +78,43 @@ func (s *StdioServer) Run(ctx context.Context) error {
 	})
 	defer session.Close()
 
+	// Create protocol and connection based on transport mode
+	var conn Conn
+
+	if s.options.ShmName != "" {
+		// Shared memory mode: open existing region created by parent process
+		conn, err := s.createShmConn(session)
+		if err != nil {
+			return err
+		}
+
+		if callbackFS != nil {
+			callbackFS.SetConnection(ctx, conn)
+		}
+		return conn.Run(ctx)
+	}
+
+	// Pipe/stdio transport mode
+	var transport Transport
+	if s.options.PipePath != "" {
+		t, err := NewPipeTransport(s.options.PipePath)
+		if err != nil {
+			return fmt.Errorf("failed to create pipe transport: %w", err)
+		}
+		defer t.Close()
+		transport = t
+	} else {
+		t := NewStdioTransport(s.options.In, s.options.Out)
+		defer t.Close()
+		transport = t
+	}
+
 	// Accept connection from transport
 	rwc, err := transport.Accept()
 	if err != nil {
 		return fmt.Errorf("failed to accept connection: %w", err)
 	}
 
-	// Create protocol and connection based on async mode
-	var conn Conn
 	if s.options.Async {
 		protocol := NewJSONRPCProtocol(rwc)
 		conn = NewAsyncConnWithProtocol(rwc, protocol, session)
@@ -105,10 +123,43 @@ func (s *StdioServer) Run(ctx context.Context) error {
 		conn = NewSyncConn(rwc, protocol, session)
 	}
 
-	// If callbacks are enabled, set the connection on the FS
 	if callbackFS != nil {
 		callbackFS.SetConnection(ctx, conn)
 	}
 
 	return conn.Run(ctx)
 }
+
+// createShmConn opens the shared memory region and creates a SyncConn backed by it.
+func (s *StdioServer) createShmConn(session *Session) (Conn, error) {
+	// Read the region size from the control header (set by Node after creating it).
+	// We need to know the size before opening. Use a default of 64MB which must
+	// match what the Node side creates.
+	const defaultShmSize = 64 * 1024 * 1024
+
+	data, err := platformShmOpen(s.options.ShmName, defaultShmSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open shared memory %q: %w", s.options.ShmName, err)
+	}
+
+	protocol, err := NewShmProtocol(data)
+	if err != nil {
+		platformShmClose(data)
+		return nil, fmt.Errorf("failed to create shm protocol: %w", err)
+	}
+
+	// Use a shmCloser as the rwc — it unmaps the region on close
+	closer := &shmCloser{data: data}
+	return NewSyncConn(closer, protocol, session), nil
+}
+
+// shmCloser implements io.ReadWriteCloser for the SyncConn interface.
+// Read/Write are no-ops since the ShmProtocol handles I/O directly.
+type shmCloser struct {
+	data []byte
+}
+
+func (c *shmCloser) Read([]byte) (int, error)  { return 0, io.EOF }
+func (c *shmCloser) Write([]byte) (int, error) { return 0, nil }
+func (c *shmCloser) Close() error              { return platformShmClose(c.data) }
+
